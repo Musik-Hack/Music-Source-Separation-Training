@@ -56,3 +56,6 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/Musik-Hack/Music-Source-Separation-Training"
+
+[tool.setuptools]
+packages = ["gui", "models", "configs"]
