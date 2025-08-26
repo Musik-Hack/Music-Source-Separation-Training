@@ -14,7 +14,7 @@ from ml_collections import ConfigDict
 from typing import List, Callable
 import loralib as lora
 
-from utils.audio_utils import prepare_data
+from utils.dataset import prepare_data
 from utils.settings import parse_args_train, initialize_environment, wandb_init, get_model_from_config
 from utils.model_utils import bind_lora_to_model, load_start_checkpoint, save_weights, normalize_batch, \
     initialize_model_and_device, get_optimizer, save_last_weights
@@ -59,6 +59,9 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
     normalize = getattr(config.training, 'normalize', False)
 
+    get_internal_loss = ( args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
+                    ) and not args.use_standard_loss
+
     pbar = tqdm(train_loader)
     for i, (batch, mixes) in enumerate(pbar):
         x = mixes.to(device)  # mixture
@@ -68,8 +71,7 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
             x, y = normalize_batch(x, y)
 
         with torch.cuda.amp.autocast(enabled=use_amp):
-            if 'roformer' in args.model_type:
-                # loss is computed in forward pass
+            if get_internal_loss:
                 loss = model(x, y)
                 if isinstance(device_ids, (list, tuple)):
                     # If it's multiple GPUs sum partial loss
@@ -130,6 +132,14 @@ def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, conf
         train_lora = args.train_lora
         save_weights(store_path, model, device_ids, train_lora)
         best_metric = metric_avg
+
+    if args.save_weights_every_epoch:
+        metric_string = ''
+        for m in metrics_avg:
+            metric_string += '_{}_{:.4f}'.format(m, metrics_avg[m])
+        store_path = f'{args.results_path}/model_{args.model_type}_ep_{epoch}{metric_string}.ckpt'
+        save_weights(store_path, model, device_ids, args.train_lora)
+
     scheduler.step(metric_avg)
     wandb.log({'metric_main': metric_avg, 'best_metric': best_metric})
     for metric_name in metrics_avg:
@@ -158,7 +168,7 @@ def train_model(args: argparse.Namespace) -> None:
     device_ids = args.device_ids
     batch_size = config.training.batch_size * len(device_ids)
 
-    wandb_init(args, config, device_ids, batch_size)
+    wandb_init(args, config, batch_size)
 
     train_loader = prepare_data(config, args, batch_size)
 

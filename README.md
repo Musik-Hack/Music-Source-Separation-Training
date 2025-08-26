@@ -20,6 +20,7 @@ Available models for training:
 * BandIt v2 [[Paper](https://arxiv.org/abs/2407.07275), [Repository](https://github.com/kwatcharasupat/bandit-v2)] Key: `bandit_v2`.
 * Apollo [[Paper](https://arxiv.org/html/2409.08514v1), [Repository](https://github.com/JusperLee/Apollo)] Key: `apollo`.
 * TS BSMamba2 [[Paper](https://arxiv.org/pdf/2409.06245), [Repository](https://github.com/baijinglin/TS-BSmamba2)] Key: `bs_mamba2`.
+* Conformer [[Paper](https://arxiv.org/abs/2005.08100), [Repository](https://github.com/lucidrains/conformer)] Key: `conformer`.
 * SCNet Tran Key: `scnet_tran`.
 * SCNet Masked Key: `scnet_masked`.
 
@@ -50,7 +51,7 @@ python train.py \
     --device_ids 0
 ```
 
-All training parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/train.py#L45).
+All training parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/utils/settings.py#L20).
 
 ### Training with LoRA
 
@@ -69,7 +70,7 @@ python inference.py \
     --store_dir separation_results/
 ```
 
-All inference parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/inference.py#L108).
+All inference parameters are [here](https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/utils/settings.py#L130).
 
 ## Useful notes
 
@@ -83,8 +84,8 @@ All inference parameters are [here](https://github.com/ZFTurbo/Music-Source-Sepa
 * `dataset.py` - dataset which creates new samples for training
 * `gui-wx.py` - GUI interface for code
 * `inference.py` - process folder with music files and separate them
-* `train.py` - main training code
-* `train_accelerate.py` - experimental training code to use with `accelerate` module. Speed up for MultiGPU.
+* `train.py` - main training code for single GPU
+* `train_ddp.py` - training code for Multi GPU config. Faster than `train.py`. Use it for 2 or more GPUs.
 * `utils.py` - common functions used by train/valid
 * `valid.py` - validation of model with metrics
 * `ensemble.py` - useful script to ensemble results of different models to make results better (see [docs](docs/ensemble.md)).   

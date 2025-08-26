@@ -10,22 +10,24 @@ from typing import Dict, List, Tuple, Union
 from omegaconf import OmegaConf
 from ml_collections import ConfigDict
 import torch.distributed as dist
-import loralib as lora
-from torch.optim import Adam, AdamW, SGD, RAdam, RMSprop
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from utils.dataset import MSSDataset
+from torch import nn
 
 
 def parse_args_train(dict_args: Union[Dict, None]) -> argparse.Namespace:
     """
-    Parse command-line arguments for configuring the model, dataset, and training parameters.
+    Parse command-line arguments for training configuration.
+
+    This function constructs an argument parser for model, dataset, training, and logging
+    options, merges overrides from a provided dictionary (if any), and returns the parsed
+    arguments. If `dict_args` is None, the arguments are parsed from `sys.argv`.
 
     Args:
-        dict_args: Dict of command-line arguments. If None, arguments will be parsed from sys.argv.
+        dict_args (Dict | None): Optional dictionary of argument overrides. Keys should
+            match the defined CLI options.
 
     Returns:
-        Namespace object containing parsed arguments and their values.
+        argparse.Namespace: Parsed arguments namespace containing all configuration
+        values required for training.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default='mdx23c',
@@ -44,7 +46,7 @@ def parse_args_train(dict_args: Union[Dict, None]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="random seed")
     parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
     parser.add_argument("--loss", type=str, nargs='+', choices=['masked_loss', 'mse_loss', 'l1_loss',
-                        'multistft_loss', 'spec_masked_loss', 'spec_rmse_loss_coef', 'log_wmse_loss'],
+                        'multistft_loss', 'spec_masked_loss', 'spec_rmse_loss', 'log_wmse_loss'],
                         default=['masked_loss'], help="List of loss functions to use")
     parser.add_argument("--masked_loss_coef", type=float, default=1., help="Coef for loss")
     parser.add_argument("--mse_loss_coef", type=float, default=1., help="Coef for loss")
@@ -54,6 +56,7 @@ def parse_args_train(dict_args: Union[Dict, None]) -> argparse.Namespace:
     parser.add_argument("--spec_masked_loss_coef", type=float, default=1, help="Coef for loss")
     parser.add_argument("--spec_rmse_loss_coef", type=float, default=1, help="Coef for loss")
     parser.add_argument("--wandb_key", type=str, default='', help='wandb API Key')
+    parser.add_argument("--wandb_offline", action='store_true', help='local wandb')
     parser.add_argument("--pre_valid", action='store_true', help='Run validation before training')
     parser.add_argument("--metrics", nargs='+', type=str, default=["sdr"],
                         choices=['sdr', 'l1_freq', 'si_sdr', 'log_wmse', 'aura_stft', 'aura_mrstft', 'bleedless',
@@ -63,11 +66,17 @@ def parse_args_train(dict_args: Union[Dict, None]) -> argparse.Namespace:
                                  'fullness'], help='Metric which will be used for scheduler.')
     parser.add_argument("--train_lora", action='store_true', help="Train with LoRA")
     parser.add_argument("--lora_checkpoint", type=str, default='', help="Initial checkpoint to LoRA weights")
-    parser.add_argument("--save_metrics", action='store_true', help="Save metrics in csv file or not")
     parser.add_argument("--each_metrics_in_name", action='store_true',
-                        help="Naming checkpoints consist only of vocal metric")
-    parser.add_argument("--more_metrics_wandb", action='store_true',
-                        help="Show metric_for_scheduler for all instuments")
+                        help="All stems in naming checkpoints")
+    parser.add_argument("--use_standard_loss", action='store_true',
+                        help="Roformers will use provided loss instead of internal")
+    parser.add_argument("--save_weights_every_epoch", action='store_true',
+                        help="Weights will be saved every epoch with all metric values")
+    parser.add_argument("--persistent_workers", action='store_true',
+                        help="dataloader persistent_workers")
+    parser.add_argument("--prefetch_factor", type=int, default=None,
+                        help="dataloader prefetch_factor")
+
 
     if dict_args is not None:
         args = parser.parse_args([])
@@ -80,18 +89,29 @@ def parse_args_train(dict_args: Union[Dict, None]) -> argparse.Namespace:
     if args.metric_for_scheduler not in args.metrics:
         args.metrics += [args.metric_for_scheduler]
 
+    get_internal_loss = (args.model_type in ('mel_band_conformer',) or 'roformer' in args.model_type
+                         ) and not args.use_standard_loss
+    if get_internal_loss:
+        args.loss = [f'{args.model_type}_loss']
     return args
 
 
 def parse_args_valid(dict_args: Union[Dict, None]) -> argparse.Namespace:
     """
-    Parse command-line arguments for configuring the model, dataset, and training parameters.
+    Parse command-line arguments for validation configuration.
+
+    Builds the CLI for model selection, configuration paths, validation data
+    locations, output/spectrogram saving options, device/runtime settings, and
+    evaluation metrics. If `dict_args` is provided, its key–value pairs override
+    or set the parsed arguments; otherwise arguments are read from `sys.argv`.
 
     Args:
-        dict_args: Dict of command-line arguments. If None, arguments will be parsed from sys.argv.
+        dict_args (Union[Dict, None]): Optional mapping of argument names to values
+            used to override or supply CLI options programmatically.
 
     Returns:
-        Namespace object containing parsed arguments and their values.
+        argparse.Namespace: Parsed arguments namespace containing all validation
+        configuration values.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default='mdx23c',
@@ -130,13 +150,20 @@ def parse_args_valid(dict_args: Union[Dict, None]) -> argparse.Namespace:
 
 def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
     """
-    Parse command-line arguments for configuring the model, dataset, and training parameters.
+    Parse command-line arguments for inference configuration.
+
+    Builds the CLI for model selection, configuration path, input/output handling,
+    device/runtime options, test-time augmentation, and optional LoRA checkpoints.
+    If `dict_args` is provided, its key–value pairs override or supply CLI options
+    programmatically; otherwise, arguments are read from `sys.argv`.
 
     Args:
-        dict_args: Dict of command-line arguments. If None, arguments will be parsed from sys.argv.
+        dict_args (Union[Dict, None]): Optional mapping of argument names to values
+            used to override or supply CLI options programmatically.
 
     Returns:
-        Namespace object containing parsed arguments and their values.
+        argparse.Namespace: Parsed arguments namespace containing all inference
+        configuration values.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_type", type=str, default='mdx23c',
@@ -175,26 +202,22 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
 
 def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaConf]:
     """
-    Load the configuration from the specified path based on the model type.
+    Load a model configuration from a file.
 
-    Parameters:
-    ----------
-    model_type : str
-        The type of model to load (e.g., 'htdemucs', 'mdx23c', etc.).
-    config_path : str
-        The path to the YAML or OmegaConf configuration file.
+    Based on `model_type`, returns either an OmegaConf (e.g., for 'htdemucs')
+    or a YAML-parsed ConfigDict for other models.
+
+    Args:
+        model_type (str): Model identifier that determines the loader behavior
+            (e.g., 'htdemucs', 'mdx23c', etc.).
+        config_path (str): Path to the configuration file (YAML/OmegaConf).
 
     Returns:
-    -------
-    config : Any
-        The loaded configuration, which can be in different formats (e.g., OmegaConf or ConfigDict).
+        Union[ConfigDict, OmegaConf]: Loaded configuration object.
 
     Raises:
-    ------
-    FileNotFoundError:
-        If the configuration file at `config_path` is not found.
-    ValueError:
-        If there is an error loading the configuration file.
+        FileNotFoundError: If `config_path` does not point to an existing file.
+        ValueError: If the configuration cannot be parsed or is otherwise invalid.
     """
     try:
         with open(config_path, 'r') as f:
@@ -209,29 +232,27 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
         raise ValueError(f"Error loading configuration: {e}")
 
 
-def get_model_from_config(model_type: str, config_path: str) -> Tuple:
+def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module, Union[ConfigDict, OmegaConf]]:
     """
-    Load the model specified by the model type and configuration file.
+    Load and instantiate a model using a configuration file.
 
-    Parameters:
-    ----------
-    model_type : str
-        The type of model to load (e.g., 'mdx23c', 'htdemucs', 'scnet', etc.).
-    config_path : str
-        The path to the configuration file (YAML or OmegaConf format).
+    Given a `model_type` and a path to a configuration, this function loads the
+    configuration (YAML or OmegaConf) and constructs the corresponding model.
+
+    Args:
+        model_type (str): Identifier of the model family (e.g., 'mdx23c', 'htdemucs',
+            'scnet', 'mel_band_conformer', etc.).
+        config_path (str): Filesystem path to the configuration file used to
+            initialize the model.
 
     Returns:
-    -------
-    model : nn.Module or None
-        The initialized model based on the `model_type`, or None if the model type is not recognized.
-    config : Any
-        The configuration used to initialize the model. This could be in different formats
-        depending on the model type (e.g., OmegaConf, ConfigDict).
+        Tuple[nn.Module, Union[ConfigDict, OmegaConf]]: A tuple containing the
+        initialized PyTorch model and the loaded configuration object.
 
     Raises:
-    ------
-    ValueError:
-        If the `model_type` is unknown or an error occurs during model initialization.
+        ValueError: If `model_type` is unknown or model initialization fails.
+        FileNotFoundError: If `config_path` does not exist (may be raised by the
+            underlying config loader).
     """
 
     config = load_config(model_type, config_path)
@@ -278,9 +299,6 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple:
     elif model_type == 'scnet_tran':
         from models.scnet.scnet_tran import SCNet_Tran
         model = SCNet_Tran(**config.model)
-    elif model_type == 'scnet_masked':
-        from models.scnet.scnet_masked import SCNet
-        model = SCNet(**config.model)
     elif model_type == 'apollo':
         from models.look2hear.models import BaseModel
         model = BaseModel.apollo(**config.model)
@@ -290,18 +308,87 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple:
     elif model_type == 'experimental_mdx23c_stht':
         from models.mdx23c_tfc_tdf_v3_with_STHT import TFC_TDF_net
         model = TFC_TDF_net(config)
+    elif model_type == 'scnet_masked':
+        from models.scnet.scnet_masked import SCNet
+        model = SCNet(**config.model)
+    elif model_type =='conformer':
+        from models.conformer_model import ConformerMSS, NeuralModel
+        model = ConformerMSS(
+            core=NeuralModel(**config.model),
+            n_fft=config.stft.n_fft,
+            hop_length=config.stft.hop_length,
+            win_length=getattr(config.stft, 'win_length', config.stft.n_fft),
+            center=config.stft.center
+        )
+    elif model_type =='mel_band_conformer':
+        from models.mel_band_conformer import MelBandConformer
+        model = MelBandConformer(**config.model)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
     return model, config
 
 
-def manual_seed(seed: int) -> None:
+def logging(logs: List[str], text: str, verbose_logging: bool = False) -> None:
     """
-    Set the random seed for reproducibility across Python, NumPy, and PyTorch.
+    Print a log message and optionally append it to an in-memory list.
+
+    In Distributed Data Parallel (DDP) contexts, the message is printed only on
+    rank 0; when DDP is uninitialized, it prints unconditionally. If
+    `verbose_logging` is True, the message is also appended to `logs`.
 
     Args:
-        seed: The seed value to set.
+        logs (List[str]): Mutable list to which the message is appended when
+            `verbose_logging` is True.
+        text (str): The log message to print (rank 0 only under DDP) and
+            optionally store.
+        verbose_logging (bool, optional): If True, append `text` to `logs`.
+            Defaults to False.
+
+    Returns:
+        None: The function prints and may mutate `logs` in place.
+    """
+    if not dist.is_initialized() or dist.get_rank()==0:
+        print(text)
+        if verbose_logging:
+            logs.append(text)
+
+
+def write_results_in_file(store_dir: str, logs: List[str]) -> None:
+    """
+    Write accumulated log messages to a results file.
+
+    Creates (or overwrites) a `results.txt` file inside `store_dir` and writes
+    each entry from `logs` as a separate line. In Distributed Data Parallel (DDP)
+    scenarios, writing is intended to occur only on rank 0.
+
+    Args:
+        store_dir (str): Directory path where `results.txt` will be saved.
+        logs (List[str]): Ordered collection of log lines to write.
+
+    Returns:
+        None
+    """
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        with open(f'{store_dir}/results.txt', 'w') as out:
+            for item in logs:
+                out.write(item + "\n")
+
+
+def manual_seed(seed: int) -> None:
+    """
+    Initialize random seeds for reproducibility.
+
+    Sets the seed across Python's `random`, NumPy, and PyTorch (CPU and CUDA)
+    libraries, and updates the `PYTHONHASHSEED` environment variable. This helps
+    ensure deterministic behavior where possible, though some GPU operations
+    may still introduce nondeterminism.
+
+    Args:
+        seed (int): The seed value to use for all random number generators.
+
+    Returns:
+        None
     """
 
     random.seed(seed)
@@ -315,12 +402,18 @@ def manual_seed(seed: int) -> None:
 
 def initialize_environment(seed: int, results_path: str) -> None:
     """
-    Initialize the environment by setting the random seed, configuring PyTorch settings,
-    and creating the results directory.
+    Initialize runtime environment settings.
+
+    Sets random seeds for reproducibility, adjusts PyTorch cuDNN behavior,
+    configures multiprocessing with the 'spawn' start method, and ensures
+    the results directory exists.
 
     Args:
-        seed: The seed value for reproducibility.
-        results_path: Path to the directory where results will be stored.
+        seed (int): Random seed value for deterministic initialization.
+        results_path (str): Filesystem path to create for saving results.
+
+    Returns:
+        None
     """
 
     manual_seed(seed)
@@ -332,98 +425,24 @@ def initialize_environment(seed: int, results_path: str) -> None:
     os.makedirs(results_path, exist_ok=True)
 
 
-def gen_wandb_name(args, config):
-    instrum = '-'.join(config['training']['instruments'])
-    time_str = time.strftime("%Y-%m-%d")
-    name = '{}_[{}]_{}'.format(args.model_type, instrum, time_str)
-    return name
-
-
-def wandb_init(args: argparse.Namespace, config: Dict, device_ids: List[int], batch_size: int) -> None:
+def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls_path: str = None) -> None:
     """
-    Initialize the Weights & Biases (wandb) logging system.
+    Initialize environment for Distributed Data Parallel (DDP) training/validation.
+
+    Sets up the DDP process group, seeds random number generators, configures
+    multiprocessing to use the 'spawn' method, and creates a results directory
+    if provided.
 
     Args:
-        args: Parsed command-line arguments containing the wandb key.
-        config: Configuration dictionary for the experiment.
-        device_ids: List of GPU device IDs used for training.
-        batch_size: Batch size for training.
-    """
-
-    if args.wandb_key is None or args.wandb_key.strip() == '':
-        wandb.init(mode='disabled')
-    else:
-        wandb.login(key=args.wandb_key)
-        wandb.init(
-            project='msst',
-            name=gen_wandb_name(args, config),
-            config={'config': config, 'args': args, 'device_ids': device_ids, 'batch_size': batch_size }
-        )
-
-def logging(logs: List[str], text: str, verbose_logging: bool = False) -> None:
-    """
-    Log validation information by printing the text and appending it to a log list.
-
-    Parameters:
-    ----------
-    store_dir : str
-        Directory to store the logs. If empty, logs are not stored.
-    logs : List[str]
-        List where the logs will be appended if the store_dir is specified.
-    text : str
-        The text to be logged, printed, and optionally added to the logs list.
+        rank (int): Rank of the current process within the DDP group.
+        world_size (int): Total number of processes participating in DDP.
+        seed (int, optional): Random seed for reproducibility. Defaults to 0.
+        resuls_path (str, optional): Directory path to create for storing results.
+            If None, no directory is created. Defaults to None.
 
     Returns:
-    -------
-    None
-        This function modifies the logs list in place and prints the text.
+        None
     """
-
-    print(text)
-    if verbose_logging:
-        logs.append(text)
-
-
-def write_results_in_file(store_dir: str, logs: List[str]) -> None:
-    """
-    Write the list of results into a file in the specified directory.
-
-    Parameters:
-    ----------
-    store_dir : str
-        The directory where the results file will be saved.
-    results : List[str]
-        A list of result strings to be written to the file.
-
-    Returns:
-    -------
-    None
-    """
-    with open(f'{store_dir}/results.txt', 'w') as out:
-        for item in logs:
-            out.write(item + "\n")
-
-
-def setup_ddp(rank: int, world_size: int):
-    """Initialize process DDP."""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'  # We can change and use another
-    os.environ["USE_LIBUV"] = "0"
-    try:
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    except:
-        print(f'NCCL are not available. Using "gloo" backend.')
-        dist.init_process_group("gloo", rank=rank, world_size=world_size)
-
-    torch.cuda.set_device(rank)
-
-
-def cleanup_ddp():
-    """Finishing DDP process."""
-    dist.destroy_process_group()
-
-
-def initialize_environment_ddp(rank: int, world_size: int, seed: int=0, resuls_path: str=None) -> None:
 
     setup_ddp(rank, world_size)
     manual_seed(seed)
@@ -432,123 +451,108 @@ def initialize_environment_ddp(rank: int, world_size: int, seed: int=0, resuls_p
         torch.multiprocessing.set_start_method('spawn', force=True)  # force=True prevent errors
     except RuntimeError as e:
         if "context has already been set" not in str(e):
-            raise
+            raise e
     if not(resuls_path is None):
         os.makedirs(resuls_path, exist_ok=True)
 
-def wandb_init_ddp(args: argparse.Namespace, config: Dict, batch_size: int) -> None:
+
+def gen_wandb_name(args, config) -> str:
     """
-    Initialize the Weights & Biases (wandb) logging system.
+    Generate a descriptive name for a Weights & Biases (wandb) run.
+
+    Combines the model type, a dash-joined list of training instruments,
+    and the current date into a single string identifier.
 
     Args:
-        args: Parsed command-line arguments containing the wandb key.
-        config: Configuration dictionary for the experiment.
-        device_ids: List of GPU device IDs used for training.
-        batch_size: Batch size for training.
-    """
-    if dist.get_rank() == 0:
-        if not args.wandb_key or args.wandb_key.strip() == '':
-            print("WandB key is not provided. Disabling WandB logging.")
-            wandb.init(mode='disabled')
-        else:
-            try:
-                wandb.login(key=args.wandb_key)
-                wandb.init(
-                    project='msst',
-                    name=gen_wandb_name(args, config),
-                    config={'config': config, 'args': args, 'device_ids': args.device_ids, 'batch_size': batch_size}
-                )
-            except Exception as e:
-                print(f"Error initializing WandB: {e}")
-                wandb.init(mode='disabled')
-
-
-def prepare_data_ddp(config: Dict, args: argparse.Namespace, batch_size: int, rank: int, world_size: int) -> DataLoader:
-    trainset = MSSDataset(
-        config,
-        args.data_path,
-        batch_size=world_size * batch_size, # to use self.config.training.num_steps without reduction
-        metadata_path=os.path.join(args.results_path, f'metadata_{args.dataset_type}.pkl'),
-        dataset_type=args.dataset_type,
-    )
-
-    sampler = DistributedSampler(trainset, num_replicas=world_size, rank=rank, shuffle=True)
-
-    train_loader = DataLoader(
-        trainset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory
-    )
-    return train_loader
-
-
-def get_optimizer_ddp(config: ConfigDict, model: torch.nn.Module) -> torch.optim.Optimizer:
-    """
-    Initializes an optimizer based on the configuration.
-
-    Args:
-        config: Configuration object containing training parameters.
-        model: PyTorch model whose parameters will be optimized.
+        args: Parsed arguments namespace containing at least `model_type`.
+        config: Configuration object/dict with a `training.instruments` field.
 
     Returns:
-        A PyTorch optimizer object configured based on the specified settings.
+        str: Formatted run name in the form
+            "<model_type>_[<instrument1>-<instrument2>-...]_<YYYY-MM-DD>".
     """
 
-    optim_params = dict()
-    if 'optimizer' in config:
-        optim_params = dict(config['optimizer'])
-        if dist.get_rank() == 0:
-            print(f'Optimizer params from config:\n{optim_params}')
-
-    name_optimizer = getattr(config.training, 'optimizer',
-                             'No optimizer in config')
-
-    if name_optimizer == 'adam':
-        optimizer = Adam(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'adamw':
-        optimizer = AdamW(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'radam':
-        optimizer = RAdam(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'rmsprop':
-        optimizer = RMSprop(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'prodigy':
-        from prodigyopt import Prodigy
-        # you can choose weight decay value based on your problem, 0 by default
-        # We recommend using lr=1.0 (default) for all networks.
-        optimizer = Prodigy(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'adamw8bit':
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=config.training.lr, **optim_params)
-    elif name_optimizer == 'sgd':
-        if dist.get_rank() == 0:
-            print('Use SGD optimizer')
-        optimizer = SGD(model.parameters(), lr=config.training.lr, **optim_params)
-    else:
-        if dist.get_rank() == 0:
-            print(f'Unknown optimizer: {name_optimizer}')
-        exit()
-    return optimizer
+    instrum = '-'.join(config['training']['instruments'])
+    time_str = time.strftime("%Y-%m-%d")
+    name = '{}_[{}]_{}'.format(args.model_type, instrum, time_str)
+    return name
 
 
-def save_weights_ddp(store_path: str, model: torch.nn.Module, train_lora: bool) -> None:
+def wandb_init(args: argparse.Namespace, config: Dict, batch_size: int) -> None:
     """
-    Save model's weights. Save only if rank==0.
+    Initialize Weights & Biases (wandb) for experiment tracking.
+
+    Depending on the provided arguments, sets up wandb in one of three modes:
+    - Offline mode when `args.wandb_offline` is True.
+    - Disabled mode when no valid `wandb_key` is provided.
+    - Online mode with authentication using `args.wandb_key`.
 
     Args:
-        store_path (str): Path to save.
-        model (torch.nn.Module): Your model to save.
-        train_lora (bool): If we used LoRA.
+        args (argparse.Namespace): Parsed arguments containing wandb options
+            (`wandb_offline`, `wandb_key`, `device_ids`).
+        config (Dict): Experiment configuration dictionary to log.
+        batch_size (int): Training batch size to include in the run configuration.
+
+    Returns:
+        None
     """
-    if dist.get_rank() == 0:  # Только главный процесс сохраняет
-        if train_lora:
-            torch.save(lora.lora_state_dict(model), store_path)
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        if args.wandb_offline:
+            wandb.init(mode='offline',
+                       project='msst',
+                       name=gen_wandb_name(args, config),
+                       config={'config': config, 'args': args, 'device_ids': args.device_ids, 'batch_size': batch_size}
+                       )
+        elif args.wandb_key is None or args.wandb_key.strip() == '':
+            wandb.init(mode='disabled')
         else:
-            torch.save(model.module.state_dict(), store_path)  # model.module всегда нужен в DDP
+            wandb.login(key=args.wandb_key)
+            wandb.init(
+                project='msst',
+                name=gen_wandb_name(args, config),
+                config={'config': config, 'args': args, 'device_ids': args.device_ids, 'batch_size': batch_size}
+            )
 
 
-def save_last_weights_ddp(args: argparse.Namespace, model: torch.nn.Module) -> None:
+def setup_ddp(rank: int, world_size: int) -> None:
+    """
+    Initialize a Distributed Data Parallel (DDP) process group.
 
-    store_path = f'{args.results_path}/last_{args.model_type}.ckpt'
-    save_weights_ddp(store_path, model, args.train_lora)
+    Configures environment variables for the DDP master node, attempts to
+    initialize the process group with the NCCL backend (preferred for GPUs),
+    and falls back to the Gloo backend if NCCL is unavailable. Also sets the
+    current CUDA device to match the process rank.
+
+    Args:
+        rank (int): Rank of the current process in the DDP group.
+        world_size (int): Total number of processes participating in DDP.
+
+    Returns:
+        None
+    """
+
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'  # We can change and use another
+    os.environ["USE_LIBUV"] = "0"
+    try:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    except:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+        if dist.get_rank()==0:
+            print(f'NCCL are not available. Using "gloo" backend.')
+
+    torch.cuda.set_device(rank)
+
+
+def cleanup_ddp() -> None:
+    """
+    Finalize and clean up a Distributed Data Parallel (DDP) process group.
+
+    Calls `torch.distributed.destroy_process_group()` to release resources
+    associated with the current DDP environment.
+
+    Returns:
+        None
+    """
+    dist.destroy_process_group()
