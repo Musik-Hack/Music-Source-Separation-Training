@@ -111,6 +111,17 @@ Look here: [Augmentations](docs/augmentations.md)
 
 Look here: [GUI documentation](docs/gui.md) or see tutorial on [Youtube](https://youtu.be/M8JKFeN7HfU)
 
+## Package installation
+
+```bash
+pip install msst
+```
+- [Getting started](docs/getting_started.md) — getting started with MSST package
+- [Python API](docs/python_api.md) — signatures, parameters, return values, and errors.
+- [Command-line interface](docs/cli.md) — command syntax and shell examples.
+- [Compatibility](docs/compatibility.md) — model extras, devices, and audio formats.
+- [Experiments](docs/experiments.md) — portable organization and tracking.
+
 ## Citation
 
 * [arxiv paper](https://arxiv.org/abs/2305.07489)
