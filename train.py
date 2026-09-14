@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from utils.settings import get_scheduler, parse_args_train, initialize_environment_ddp, \
-    initialize_environment, get_model_from_config, wandb_init
+    initialize_environment, get_model_from_config, wandb_init, apply_augmentation_overrides
 from utils.model_utils import save_weights, normalize_batch, \
     save_last_weights, initialize_model_and_device
 
@@ -307,6 +307,7 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     else:
         initialize_environment(args.seed, args.results_path)
     model, config = get_model_from_config(args.model_type, args.config_path)
+    config = apply_augmentation_overrides(config, args)
     if 'model_type' in config.training:
         args.model_type = config.training.model_type
     use_amp = getattr(config.training, 'use_amp', True)

@@ -149,3 +149,90 @@ Notes:
 * If you want to disable some augmentation, just set it to zero.
 * Augmentations in `all` subsections applied to all stems
 * Augmentations in `vocals`, `bass` etc subsections applied only to corresponding stems. You can create such subsections for all stems which are given in `training.instruments`.
+
+### Command-line subprocess augmentations
+
+External audio commands can be run on each temporary chunk with the optional
+`subprocess` section. Relative `search_paths` are resolved from the directory of
+the training YAML, then executable names are searched on `PATH`. The chunk is
+written as a WAV file, the command is launched without a shell, and the
+resulting WAV file is read back as `float32`. ZFTurbo training tensors are
+float32; `pcm_type` controls only the temporary file handoff. Use `FLOAT` to
+avoid extra quantization, or `PCM_24`/`PCM_16` when the command should emulate
+fixed-point output. The handoff uses `audio.sample_rate` unless a section or
+rule explicitly overrides `sample_rate`. Because this feature intentionally
+launches executables, configure only binaries that you trust:
+
+```config
+augmentations:
+  enable: true
+  subprocess:
+    search_paths: # optional; use absolute paths or paths relative to the config
+      - ../../plugs/build/bin
+    timeout_seconds: 10 # default for rules that do not override it
+    pcm_type: FLOAT # default; also supports PCM_24 and PCM_16
+    all:
+      - probability: 0.05
+        executable: my-audio-augmentation
+        args: ["--input", "{input}", "--output", "{output}", "--strength", "0.2"]
+    mix:
+      - probability: 0.10
+        executable: mix-only-augmentation
+        args: ["{input}", "{output}"]
+    vocals:
+      - probability: 0.02
+        executable: ../../plugs/build/bin/vocals-only-augmentation
+        args: ["{input}", "{output}"]
+        timeout_seconds: 5
+```
+
+Only `{input}` and `{output}` placeholders are replaced, and both are required.
+Commands run directly with their argument list, so there is no shell
+interpolation. The command must write to `{output}`, preserve the input sample
+rate and channel count, and
+produce the same number of samples unless `allow_length_change: true`; that
+option trims or zero-pads the result to the training chunk length.
+
+Subprocess targets are `all`, each name in `training.instruments`, and
+`mix` (`mixture` is accepted as an alias). A rule under `mix` is applied only
+to the summed model input. The training CLI can also add rules without editing
+the main config:
+
+```sh
+python train.py ... \
+  --augmentation_config augmentations.yaml \
+  --subprocess_augmentation vocals '{"executable": "binary", "args": ["{input}", "{output}"]}' \
+  --subprocess_augmentation mix '{"executable": "binary", "args": ["{input}", "{output}"]}'
+```
+
+`--subprocess_augmentation` is repeatable and accepts an inline YAML/JSON
+mapping or a rule-file path. `--augmentation_config` accepts a separate YAML
+file whose `augmentations` section is merged into the main config; its
+`search_paths` are resolved relative to that file.
+CLI rules enable augmentations when no `enable` value exists; an explicit
+`augmentations.enable: false` must be changed or omitted before using them.
+
+### Mixture-only subprocess augmentations
+
+Use `subprocess_on_mixture` to run a mastering, limiting, resampling, or other
+chain on the final training mixture after it has been summed from the stems:
+
+```config
+augmentations:
+  enable: true
+  subprocess_on_mixture:
+    search_paths:
+      - ../../plugs/build/bin
+    pcm_type: FLOAT
+    rules:
+      - probability: 0.25
+        executable: mastering-plugin-cli
+        args: ["--input", "{input}", "--output", "{output}", "--ceiling-db", "-0.3"]
+```
+
+This stage changes only the model input; the training targets remain the
+original, unprocessed stems. That is useful when real production mixtures have
+been mastered and therefore do not exactly equal the sum of their source stems,
+but it intentionally violates the additive target assumption. Keep the
+probability modest, monitor validation SDR carefully, and do not use it to
+transform validation data automatically.

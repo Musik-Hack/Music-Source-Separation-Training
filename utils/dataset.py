@@ -25,6 +25,11 @@ import warnings
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from utils.subprocess_augmentation import (
+    apply_subprocess_augmentations,
+    apply_subprocess_mixture_augmentations,
+    validate_subprocess_augmentations,
+)
 warnings.filterwarnings("ignore")
 import argparse
 
@@ -259,9 +264,12 @@ class MSSDataset(torch.utils.data.Dataset):
         self.aug = False
         if 'augmentations' in config:
             if config['augmentations'].enable is True:
+                self.aug = True
                 if self.verbose and should_print:
                     print('Use augmentation for training')
-                self.aug = True
+                validate_subprocess_augmentations(
+                    self.config["augmentations"], self.config.get("_config_path")
+                )
         else:
             if self.verbose and should_print:
                 print('There is no augmentations block in config. Augmentations disabled for training...')
@@ -346,6 +354,13 @@ class MSSDataset(torch.utils.data.Dataset):
                 if mix.shape != required_shape:
                     mix = mix[..., :required_shape[-1]]
                 mix = torch.tensor(mix, dtype=torch.float32)
+            if (
+                self.config['augmentations'].get('subprocess')
+                or 'subprocess_on_mixture' in self.config['augmentations']
+            ):
+                mix_conv = mix.cpu().numpy().astype(np.float32)
+                mix_conv = apply_subprocess_mixture_augmentations(mix_conv, self.config)
+                mix = torch.tensor(mix_conv, dtype=torch.float32)
 
         # If we need to optimize only given stem
         if self.config.training.target_instrument is not None:
@@ -1061,6 +1076,7 @@ class MSSDataset(torch.utils.data.Dataset):
     def augm_data(self, source, instr):
         # source.shape = (2, 261120) - first channels, second length
         source_shape = source.shape
+        source = apply_subprocess_augmentations(source, self.config, instr)
         applied_augs = []
         if 'all' in self.config['augmentations']:
             augs = self.config['augmentations']['all']

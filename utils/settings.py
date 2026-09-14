@@ -56,6 +56,12 @@ def parse_args_train(dict_args: Union[argparse.Namespace, Dict, None]) -> argpar
     parser.add_argument("--valid_path", nargs="+", type=str,
                         help="validation data paths. You can provide several folders.")
     parser.add_argument("--num_workers", type=int, default=0, help="dataloader num_workers")
+    parser.add_argument("--augmentation_config", type=str, default='',
+                        help="optional YAML file containing an augmentations section to merge")
+    parser.add_argument("--subprocess_augmentation", nargs=2, action='append', default=[],
+                        metavar=('TARGET', 'RULE'),
+                        help="repeatable subprocess augmentation; TARGET is all, mix, mixture, or an instrument, "
+                             "and RULE is a YAML/JSON mapping or path to one")
     parser.add_argument("--pin_memory", action='store_true', help="dataloader pin_memory")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
     parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
@@ -277,11 +283,119 @@ def load_config(model_type: str, config_path: str) -> Union[ConfigDict, OmegaCon
                 config = OmegaConf.load(config_path)
             else:
                 config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+            config['_config_path'] = os.path.abspath(config_path)
             return config
     except FileNotFoundError:
         raise FileNotFoundError(f"Configuration file not found at {config_path}")
     except Exception as e:
         raise ValueError(f"Error loading configuration: {e}")
+
+
+def _merge_augmentation_values(target, source):
+    for key, value in source.items():
+        value_is_mapping = hasattr(value, 'items') and callable(value.items)
+        target_value = target.get(key) if hasattr(target, 'get') else None
+        target_is_mapping = hasattr(target_value, 'items') and callable(target_value.items)
+        if value_is_mapping and target_is_mapping:
+            _merge_augmentation_values(target[key], value)
+        else:
+            target[key] = value
+
+
+def _load_yaml_value(value, base_path=''):
+    if os.path.isfile(value):
+        path = os.path.abspath(value)
+    elif base_path and not value.lstrip().startswith(('{', '[')):
+        path = os.path.abspath(os.path.join(base_path, value))
+    else:
+        path = None
+
+    if path:
+        with open(path, 'r') as handle:
+            return yaml.load(handle, Loader=yaml.FullLoader)
+    return yaml.safe_load(value)
+
+
+def apply_augmentation_overrides(config, args):
+    """Merge CLI augmentation settings into a loaded training config."""
+    from utils.subprocess_augmentation import _is_list
+
+    config_path = getattr(args, 'config_path', None) or config.get('_config_path')
+    if config_path:
+        config['_config_path'] = os.path.abspath(str(config_path))
+
+    override_path = getattr(args, 'augmentation_config', '')
+    if override_path:
+        if not os.path.isfile(override_path):
+            raise FileNotFoundError(f"Augmentation config not found at {override_path}")
+        with open(override_path, 'r') as handle:
+            override = yaml.load(handle, Loader=yaml.FullLoader)
+        if not isinstance(override, dict):
+            raise ValueError("Augmentation config must contain a mapping")
+        if 'augmentations' in override:
+            override = override['augmentations']
+        if not isinstance(override, dict):
+            raise ValueError("Augmentation config must contain an augmentations mapping")
+
+        base_dir = os.path.dirname(os.path.abspath(override_path))
+        for section_name in ('subprocess', 'subprocess_on_mixture'):
+            section = override.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            search_paths = section.get('search_paths')
+            if isinstance(search_paths, list):
+                section['search_paths'] = [
+                    os.path.abspath(os.path.join(base_dir, path))
+                    for path in search_paths
+                ]
+
+        if 'augmentations' not in config:
+            config['augmentations'] = {}
+        _merge_augmentation_values(config['augmentations'], override)
+
+    subprocess_rules = getattr(args, 'subprocess_augmentation', []) or []
+    training = config.get('training', {})
+    instruments = training.get('instruments', [])
+    if subprocess_rules:
+        if 'augmentations' not in config:
+            config['augmentations'] = {}
+        if 'enable' not in config['augmentations']:
+            config['augmentations']['enable'] = True
+        elif not config['augmentations']['enable']:
+            raise ValueError(
+                "Subprocess augmentation CLI rules require augmentations.enable=true"
+            )
+    for target, rule_source in subprocess_rules:
+        valid_targets = set(['all', 'mix', 'mixture'] + list(instruments))
+        if target not in valid_targets:
+            choices = ', '.join(sorted(valid_targets))
+            raise ValueError(
+                f"Unknown subprocess augmentation target {target}; choose one of: {choices}"
+            )
+        rule = _load_yaml_value(rule_source)
+        if not isinstance(rule, dict):
+            raise ValueError(
+                f"Subprocess augmentation rule for {target} must be a mapping"
+            )
+        target_name = 'mix' if target == 'mixture' else target
+        if 'augmentations' not in config:
+            config['augmentations'] = {}
+        if 'subprocess' not in config['augmentations']:
+            config['augmentations']['subprocess'] = {}
+        subprocess_config = config['augmentations']['subprocess']
+        if target_name not in subprocess_config or subprocess_config[target_name] is None:
+            subprocess_config[target_name] = []
+        elif not _is_list(subprocess_config[target_name]):
+            raise ValueError(
+                f"Cannot append subprocess augmentation rules to non-list target {target_name}"
+            )
+        subprocess_config[target_name].append(rule)
+
+    from utils.subprocess_augmentation import validate_subprocess_augmentations
+
+    validate_subprocess_augmentations(config['augmentations'], config_path)
+
+    return config
 
 
 def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module, Union[ConfigDict, OmegaConf]]:

@@ -26,7 +26,7 @@ from accelerate import Accelerator
 from utils.dataset import MSSDataset
 from utils.model_utils import demix, prefer_target_instrument, load_not_compatible_weights
 from utils.metrics import sdr
-from utils.settings import manual_seed, get_model_from_config
+from utils.settings import manual_seed, get_model_from_config, apply_augmentation_overrides
 from utils.losses import masked_loss
 import warnings
 
@@ -101,6 +101,11 @@ def train_model(args):
     parser.add_argument("--dataset_type", type=int, default=1, help="Dataset type. Must be one of: 1, 2, 3 or 4. Details here: https://github.com/ZFTurbo/Music-Source-Separation-Training/blob/main/docs/dataset_types.md")
     parser.add_argument("--valid_path", nargs="+", type=str, help="validation data paths. You can provide several folders.")
     parser.add_argument("--num_workers", type=int, default=0, help="dataloader num_workers")
+    parser.add_argument("--augmentation_config", type=str, default='', help="optional YAML file containing an augmentations section to merge")
+    parser.add_argument("--subprocess_augmentation", nargs=2, action='append', default=[],
+                        metavar=('TARGET', 'RULE'),
+                        help="repeatable subprocess augmentation; TARGET is all, mix, mixture, or an instrument, "
+                             "and RULE is a YAML/JSON mapping or path to one")
     parser.add_argument("--pin_memory", type=bool, default=False, help="dataloader pin_memory")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
     parser.add_argument("--device_ids", nargs='+', type=int, default=[0], help='list of gpu ids')
@@ -120,6 +125,7 @@ def train_model(args):
     torch.multiprocessing.set_start_method('spawn')
 
     model, config = get_model_from_config(args.model_type, args.config_path)
+    config = apply_augmentation_overrides(config, args)
     if 'model_type' in config.training:
         args.model_type = config.training.model_type
     accelerator.print("Instruments: {}".format(config.training.instruments))
