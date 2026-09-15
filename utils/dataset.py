@@ -30,6 +30,9 @@ from utils.subprocess_augmentation import (
     apply_subprocess_mixture_augmentations,
     validate_subprocess_augmentations,
 )
+from utils.fuel import FuelAugmentation
+from utils.mp2 import MP2Augmentation
+from utils.sweeteq import SweetEQAugmentation
 warnings.filterwarnings("ignore")
 import argparse
 
@@ -262,6 +265,7 @@ class MSSDataset(torch.utils.data.Dataset):
 
         # Augmentation block
         self.aug = False
+        self.mix_plugin_augmentations = []
         if 'augmentations' in config:
             if config['augmentations'].enable is True:
                 self.aug = True
@@ -270,6 +274,19 @@ class MSSDataset(torch.utils.data.Dataset):
                 validate_subprocess_augmentations(
                     self.config["augmentations"], self.config.get("_config_path")
                 )
+                for key, augmentation_class in (
+                    ('fuel_on_mixture', FuelAugmentation),
+                    ('mp2_on_mixture', MP2Augmentation),
+                    ('sweeteq_on_mixture', SweetEQAugmentation),
+                ):
+                    if self.config['augmentations'].get(key):
+                        self.mix_plugin_augmentations.append(
+                            augmentation_class.from_config(
+                                self.config['augmentations'][key],
+                                config_path=self.config.get('_config_path'),
+                                sample_rate=int(self.config.audio.sample_rate),
+                            )
+                        )
         else:
             if self.verbose and should_print:
                 print('There is no augmentations block in config. Augmentations disabled for training...')
@@ -338,6 +355,12 @@ class MSSDataset(torch.utils.data.Dataset):
                     res *= loud_values[:, None, None]
         if self.dataset_type != 6 and self.dataset_type!=7:
             mix = res.sum(0)
+
+        if self.aug and self.mix_plugin_augmentations:
+            for mix_plugin_augmentation in self.mix_plugin_augmentations:
+                mix_conv = mix.cpu().numpy().astype(np.float32)
+                mix_conv = mix_plugin_augmentation(mix_conv)
+                mix = torch.tensor(mix_conv, dtype=torch.float32)
 
         if self.aug:
             if 'mp3_compression_on_mixture' in self.config['augmentations']:
