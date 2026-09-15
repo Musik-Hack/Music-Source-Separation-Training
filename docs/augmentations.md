@@ -209,6 +209,23 @@ python train.py ... \
 mapping or a rule-file path. `--augmentation_config` accepts a separate YAML
 file whose `augmentations` section is merged into the main config; its
 `search_paths` are resolved relative to that file.
+
+An augmentation config can compose reusable presets with top-level `includes`.
+Include paths are resolved relative to the including file, nested includes are
+supported, mappings are merged recursively, and rule lists are concatenated:
+
+```config
+includes:
+  - presets/mastering.yaml
+  - presets/eq.yaml
+
+augmentations:
+  enable: true
+```
+
+Each included file may use either an `augmentations:` wrapper or place its
+`subprocess` section at the top level. Later values override earlier scalar
+values, while matching rule lists are appended in include order.
 CLI rules enable augmentations when no `enable` value exists; an explicit
 `augmentations.enable: false` must be changed or omitted before using them.
 

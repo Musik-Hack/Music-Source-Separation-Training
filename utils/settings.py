@@ -298,6 +298,8 @@ def _merge_augmentation_values(target, source):
         target_is_mapping = hasattr(target_value, 'items') and callable(target_value.items)
         if value_is_mapping and target_is_mapping:
             _merge_augmentation_values(target[key], value)
+        elif isinstance(target_value, list) and isinstance(value, list):
+            target[key] = [*target_value, *value]
         else:
             target[key] = value
 
@@ -316,6 +318,59 @@ def _load_yaml_value(value, base_path=''):
     return yaml.safe_load(value)
 
 
+def _resolve_augmentation_search_paths(override, base_dir):
+    for section_name in ('subprocess', 'subprocess_on_mixture'):
+        section = override.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        search_paths = section.get('search_paths')
+        if isinstance(search_paths, list):
+            section['search_paths'] = [
+                os.path.abspath(os.path.join(base_dir, path))
+                for path in search_paths
+            ]
+
+
+def _load_augmentation_override(path, seen=()):
+    override_path = os.path.abspath(path)
+    if override_path in seen:
+        raise ValueError(f"Circular augmentation config include: {override_path}")
+    if not os.path.isfile(override_path):
+        raise FileNotFoundError(f"Augmentation config not found at {override_path}")
+
+    with open(override_path, 'r') as handle:
+        root = yaml.load(handle, Loader=yaml.FullLoader)
+    if not isinstance(root, dict):
+        raise ValueError("Augmentation config must contain a mapping")
+
+    includes = []
+    augmentation_values = {}
+    if 'includes' in root:
+        includes = root.pop('includes')
+        augmentation_values = root.pop('augmentations', root)
+    elif 'augmentations' in root:
+        augmentation_values = root.pop('augmentations')
+    else:
+        augmentation_values = root
+
+    if not isinstance(includes, list):
+        raise ValueError("Augmentation config includes must be a list")
+    if not isinstance(augmentation_values, dict):
+        raise ValueError("Augmentation config must contain an augmentations mapping")
+
+    base_dir = os.path.dirname(override_path)
+    merged = {}
+    for include in includes:
+        if not isinstance(include, str) or not include.strip():
+            raise ValueError("Augmentation config includes must contain path strings")
+        include_path = os.path.abspath(os.path.join(base_dir, include))
+        included = _load_augmentation_override(include_path, seen + (override_path,))
+        _merge_augmentation_values(merged, included)
+    _merge_augmentation_values(merged, augmentation_values)
+    _resolve_augmentation_search_paths(merged, base_dir)
+    return merged
+
+
 def apply_augmentation_overrides(config, args):
     """Merge CLI augmentation settings into a loaded training config."""
     from utils.subprocess_augmentation import _is_list
@@ -328,26 +383,7 @@ def apply_augmentation_overrides(config, args):
     if override_path:
         if not os.path.isfile(override_path):
             raise FileNotFoundError(f"Augmentation config not found at {override_path}")
-        with open(override_path, 'r') as handle:
-            override = yaml.load(handle, Loader=yaml.FullLoader)
-        if not isinstance(override, dict):
-            raise ValueError("Augmentation config must contain a mapping")
-        if 'augmentations' in override:
-            override = override['augmentations']
-        if not isinstance(override, dict):
-            raise ValueError("Augmentation config must contain an augmentations mapping")
-
-        base_dir = os.path.dirname(os.path.abspath(override_path))
-        for section_name in ('subprocess', 'subprocess_on_mixture'):
-            section = override.get(section_name)
-            if not isinstance(section, dict):
-                continue
-            search_paths = section.get('search_paths')
-            if isinstance(search_paths, list):
-                section['search_paths'] = [
-                    os.path.abspath(os.path.join(base_dir, path))
-                    for path in search_paths
-                ]
+        override = _load_augmentation_override(override_path)
 
         if 'augmentations' not in config:
             config['augmentations'] = {}
